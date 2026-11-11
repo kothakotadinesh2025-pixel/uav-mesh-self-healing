@@ -29,17 +29,53 @@ def plot_baselines_dashboard(env, coords_b1, m_b1, coords_b2, m_b2, coords_b3, m
     for ax, (coords, metrics, name) in zip((axes[0, 0], axes[0, 1], axes[1, 0]), states):
         title = f"{name}\nGBS coverage {metrics['coverage_ratio']*100:.1f}% | components {metrics['n_components']} | cuts {metrics['n_articulation']}"
         _draw_network(ax, env, coords, metrics, title)
-    ax = axes[1, 1]
-    names = ["K-Means", "K-Means+MST", "Greedy", "NSGA-II"]
+
+    ax_bar = axes[1, 1]
+    labels = ["K-Means", "K-Means+MST", "Greedy", "NSGA-II (Ours)"]
     metrics_list = [m_b1, m_b2, m_b3, m_p1]
-    x = np.arange(4)
-    ax.bar(x - 0.18, [m["raw_coverage_ratio"] * 100 for m in metrics_list], 0.36, label="Raw coverage (%)")
-    ax.bar(x + 0.18, [m["coverage_ratio"] * 100 for m in metrics_list], 0.36, label="GBS-connected coverage (%)")
-    ax.set_xticks(x, names)
-    ax.set_ylim(0, 100)
-    ax.set_title("Baseline and optimizer coverage comparison")
-    ax.grid(True, axis="y", alpha=0.35)
-    ax.legend(fontsize=8)
+    raw_cov = [m["raw_coverage_ratio"] * 100.0 for m in metrics_list]
+    gbs_cov = [m["coverage_ratio"] * 100.0 for m in metrics_list]
+    cuts = [m["n_articulation"] for m in metrics_list]
+
+    x = np.arange(len(labels))
+    width = 0.26
+    bars_raw = ax_bar.bar(x - width, raw_cov, width, label="Raw Local Coverage (%)", color="#3498db")
+    bars_gbs = ax_bar.bar(x, gbs_cov, width, label="GBS-Connected Coverage (%)", color="#2ecc71")
+    ax_cut = ax_bar.twinx()
+    bars_cuts = ax_cut.bar(x + width, cuts, width, label="Cut Vertices (Lower = Better)", color="#e74c3c")
+
+    ax_bar.set_ylabel("Coverage (%)")
+    ax_cut.set_ylabel("Cut Vertices (Single Points of Failure)", color="#c0392b")
+    ax_cut.tick_params(axis="y", labelcolor="#c0392b")
+    ax_bar.set_xticks(x)
+    ax_bar.set_xticklabels(labels, fontweight="bold", rotation=10)
+    ax_bar.set_ylim(0, 112)
+    ax_cut.set_ylim(0, max(cuts, default=0) + 4)
+    ax_bar.set_title("Baseline vs. Optimizer: Coverage & Topological Fragility")
+    ax_bar.grid(True, axis="y", alpha=0.35)
+
+    for bars, axis, formatter in (
+        (bars_raw, ax_bar, lambda value: f"{value:.1f}%"),
+        (bars_gbs, ax_bar, lambda value: f"{value:.1f}%"),
+        (bars_cuts, ax_cut, lambda value: f"{int(value)}"),
+    ):
+        for bar in bars:
+            height = bar.get_height()
+            axis.annotate(
+                formatter(height),
+                (bar.get_x() + bar.get_width() / 2.0, height),
+                xytext=(0, 3),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+                fontsize=7,
+                rotation=0,
+            )
+
+    handles1, labels1 = ax_bar.get_legend_handles_labels()
+    handles2, labels2 = ax_cut.get_legend_handles_labels()
+    ax_bar.legend(handles1 + handles2, labels1 + labels2, loc="upper center", fontsize=7, ncol=1)
+
     fig.tight_layout()
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     fig.savefig(Path(output_dir) / "baseline_dashboard.png", dpi=180)
