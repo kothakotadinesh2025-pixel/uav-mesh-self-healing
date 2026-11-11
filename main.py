@@ -1,126 +1,92 @@
+import csv
+import time
 from pathlib import Path
 
-import matplotlib.pyplot as plt
-from matplotlib.patches import Circle
 import numpy as np
 
+from src.baselines import run_baseline_1_pure_kmeans, run_baseline_2_kmeans_mst, run_baseline_3_connected_greedy
+from src.config import SimConfig
+from src.graph_engine import evaluate_mesh_topology
+from src.nsga2_optimizer import ConstrainedNSGA2Optimizer
+from src.physics import DisasterEnvironment
+from src.self_healing import SelfHealingController
+from src.visualizer import plot_baselines_dashboard, plot_complete_dashboard
 
-def plot_baselines_dashboard(env, coords_b1, m_b1, coords_b2, m_b2, coords_b3, m_b3, coords_p1, m_p1):
-    fig, axes = plt.subplots(2, 2, figsize=(18, 14), dpi=115)
 
-    panels = [
-        (axes[0, 0], coords_b1, m_b1, "1. Baseline 1: Pure K-Means"),
-        (axes[0, 1], coords_b2, m_b2, "2. Baseline 2: K-Means + MST"),
-        (axes[1, 0], coords_b3, m_b3, "3. Baseline 3: Connected Greedy"),
+def _save_metrics(path, rows):
+    fields = ["algorithm", "raw_coverage_percent", "gbs_coverage_percent", "components", "cut_vertices", "fiedler_lambda2", "constraint_violation"]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for name, metrics in rows:
+            writer.writerow({
+                "algorithm": name,
+                "raw_coverage_percent": 100.0 * metrics["raw_coverage_ratio"],
+                "gbs_coverage_percent": 100.0 * metrics["coverage_ratio"],
+                "components": metrics["n_components"],
+                "cut_vertices": metrics["n_articulation"],
+                "fiedler_lambda2": metrics["algebraic_connectivity"],
+                "constraint_violation": metrics["cv"],
+            })
+
+
+def main(config=None, show=True):
+    start = time.time()
+    config = config or SimConfig()
+    output_dir = Path("outputs")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    env = DisasterEnvironment(config=config)
+    print(f"[*] Generated {env.n_users} survivors in {env.n_clusters} hotspots; {env.n_uavs} UAVs.")
+    print(f"[*] Optimal altitude: {env.h_opt:.1f} m; coverage radius: {env.ground_coverage_radius(env.h_opt):.1f} m\n")
+
+    print("[*] Evaluating baseline algorithms...")
+    coords_b1, m_b1 = run_baseline_1_pure_kmeans(env)
+    coords_b2, m_b2 = run_baseline_2_kmeans_mst(env)
+    coords_b3, m_b3 = run_baseline_3_connected_greedy(env)
+
+    print(f"\n[*] Running constrained NSGA-II ({config.n_gen} generations)...")
+    optimizer = ConstrainedNSGA2Optimizer(env, config.pop_size, config.n_gen, seed=config.rng_seed)
+    population, objectives, violations, history = optimizer.run()
+    feasible = np.flatnonzero(violations == 0.0)
+    best_idx = feasible[np.argmin(objectives[feasible, 0])] if len(feasible) else int(np.argmin(violations))
+    coords_p1 = population[best_idx].reshape(env.n_uavs, 3)
+    m_p1 = evaluate_mesh_topology(coords_p1, env)
+
+    center = coords_p1[:, :2].mean(axis=0)
+    failed_idx = int(np.argmin(np.linalg.norm(coords_p1[:, :2] - center, axis=1)))
+    coords_fail = np.delete(coords_p1, failed_idx, axis=0)
+    m_fail = evaluate_mesh_topology(coords_fail, env)
+    print(f"\n[*] Simulated crash: UAV #{failed_idx + 1}; running self-healing controller...")
+    coords_heal, m_heal = SelfHealingController(env, seed=config.rng_seed).heal_mesh(coords_fail, episodes=95)
+
+    rows = [
+        ("Baseline 1: Pure K-Means", m_b1),
+        ("Baseline 2: K-Means + MST", m_b2),
+        ("Baseline 3: Connected Greedy", m_b3),
+        ("Proposed: NSGA-II Phase 1", m_p1),
+        (f"Mid-mission crash (UAV #{failed_idx + 1})", m_fail),
+        ("Proposed: Self-Healed Phase 2", m_heal),
     ]
+    print("\n" + "=" * 100)
+    print(f"{'ALGORITHM / STAGE':<38} | {'RAW':>7} | {'GBS':>7} | {'COMP':>5} | {'CUT':>5} | {'LAMBDA2':>8}")
+    print("-" * 100)
+    for name, metrics in rows:
+        print(f"{name:<38} | {100*metrics['raw_coverage_ratio']:6.1f}% | {100*metrics['coverage_ratio']:6.1f}% | {metrics['n_components']:5d} | {metrics['n_articulation']:5d} | {metrics['algebraic_connectivity']:8.3f}")
+    print("=" * 100)
 
-    for ax, uavs, metrics, title in panels:
-        covered = metrics["covered_mask"]
-        ax.scatter(env.users[covered, 0], env.users[covered, 1], c="#27ae60", s=8, alpha=0.65)
-        ax.scatter(env.users[~covered, 0], env.users[~covered, 1], c="#e74c3c", marker="x", s=14, alpha=0.80)
-
-        all_nodes = np.vstack([env.gbs_pos, uavs])
-        for u, v in metrics["edges"]:
-            ax.plot([all_nodes[u, 0], all_nodes[v, 0]], [all_nodes[u, 1], all_nodes[v, 1]], color="#1f618d", linewidth=1.2, alpha=0.75)
-
-        radii = env.ground_coverage_radius(uavs[:, 2])
-        for i, ((x, y, _), r) in enumerate(zip(uavs, radii)):
-            node_id = i + 1
-            is_active = i in metrics["active_uav_indices"]
-            is_cut = node_id in metrics["articulation_nodes"]
-            if not is_active:
-                color_fill, color_node, linestyle = "#95a5a6", "#7f8c8d", ":"
-            elif is_cut:
-                color_fill, color_node, linestyle = "#e67e22", "#d35400", "--"
-            else:
-                color_fill, color_node, linestyle = "#3498db", "#1b4f72", "-"
-
-            ax.add_patch(Circle((x, y), r, color=color_fill, alpha=0.10, lw=1.1, ls=linestyle))
-            ax.scatter(x, y, c=color_node, s=68, zorder=5, edgecolors="white", linewidth=1.0)
-
-        ax.scatter(env.gbs_pos[0], env.gbs_pos[1], c="#5b2c6f", marker="s", s=130, zorder=6)
-        ax.set_title(title, fontsize=10.5, fontweight="bold")
-        ax.set_xlim(0, env.area_size)
-        ax.set_ylim(0, env.area_size)
-        ax.set_xlabel("X Coordinate (meters)")
-        ax.set_ylabel("Y Coordinate (meters)")
-        ax.grid(True, linestyle=":", alpha=0.4)
-
-    ax_bar = axes[1, 1]
-    categories = [
-        "Raw Local\nCoverage (%)",
-        "True GBS-Connected\nCoverage (%)",
-        "Disconnected\nComponents",
-        "Cut Vertices\n(Single Pt Failures)",
-    ]
-    vals_b1 = [m_b1["raw_coverage_ratio"] * 100, m_b1["coverage_ratio"] * 100, m_b1["n_components"], m_b1["n_articulation"]]
-    vals_b2 = [m_b2["raw_coverage_ratio"] * 100, m_b2["coverage_ratio"] * 100, m_b2["n_components"], m_b2["n_articulation"]]
-    vals_b3 = [m_b3["raw_coverage_ratio"] * 100, m_b3["coverage_ratio"] * 100, m_b3["n_components"], m_b3["n_articulation"]]
-    vals_p1 = [m_p1["raw_coverage_ratio"] * 100, m_p1["coverage_ratio"] * 100, m_p1["n_components"], m_p1["n_articulation"]]
-
-    x_pos = np.arange(len(categories))
-    w = 0.20
-
-    ax_bar.bar(x_pos - 1.5 * w, vals_b1, w, label="Baseline 1: Pure K-Means", color="#7f8c8d")
-    ax_bar.bar(x_pos - 0.5 * w, vals_b2, w, label="Baseline 2: K-Means + MST", color="#e67e22")
-    ax_bar.bar(x_pos + 0.5 * w, vals_b3, w, label="Baseline 3: Connected Greedy", color="#8e44ad")
-    ax_bar.bar(x_pos + 1.5 * w, vals_p1, w, label="Proposed: Constrained NSGA-II", color="#27ae60")
-
-    ax_bar.set_title("4. Benchmark Comparison: Baselines vs Proposed NSGA-II", fontsize=11.0, fontweight="bold")
-    ax_bar.set_xticks(x_pos)
-    ax_bar.set_xticklabels(categories, fontsize=9.0, fontweight="bold")
-    ax_bar.set_ylabel("Metric Value")
-    ax_bar.grid(True, axis="y", linestyle="--", alpha=0.4)
-    ax_bar.legend(loc="upper right", fontsize=8.5)
-
-    plt.tight_layout()
-    output_path = Path("outputs")
-    output_path.mkdir(exist_ok=True)
-    fig.savefig(output_path / "baseline_dashboard.png", dpi=180)
+    _save_metrics(output_dir / "benchmark_metrics.csv", rows)
+    fig1 = plot_baselines_dashboard(env, coords_b1, m_b1, coords_b2, m_b2, coords_b3, m_b3, coords_p1, m_p1, output_dir)
+    fig2 = plot_complete_dashboard(env, history, coords_p1, m_p1, failed_idx, coords_fail, m_fail, coords_heal, m_heal, output_dir)
+    print(f"[*] Runtime: {time.time() - start:.1f}s. Results saved in {output_dir}/")
+    if show:
+        import matplotlib.pyplot as plt
+        plt.show()
+    else:
+        import matplotlib.pyplot as plt
+        plt.close(fig1)
+        plt.close(fig2)
+    return rows
 
 
-def plot_complete_dashboard(env, hist_cov, coords_p1, metrics_p1, failed_idx, coords_fail, metrics_fail, coords_heal, metrics_heal):
-    fig, axes = plt.subplots(2, 2, figsize=(18, 14), dpi=115)
-
-    ax_conv = axes[0, 0]
-    gens = range(1, len(hist_cov) + 1)
-    ax_conv.plot(gens, hist_cov, color="#1f618d", linewidth=2.5, label="Best Feasible Coverage (%)")
-    ax_conv.fill_between(gens, hist_cov, min(hist_cov) - 1.0, color="#3498db", alpha=0.15)
-    ax_conv.set_title(f"1. Large-Scale NSGA-II Convergence ({env.n_uavs} UAVs, {env.n_users} Survivors)", fontsize=11.5, fontweight="bold")
-    ax_conv.set_xlabel("Evolutionary Generation")
-    ax_conv.set_ylabel("Coverage (%)")
-    ax_conv.set_ylim(max(0.0, min(hist_cov) - 3.0), min(102.0, max(hist_cov) + 3.0))
-    ax_conv.grid(True, linestyle="--", alpha=0.4)
-    ax_conv.legend(loc="lower right")
-
-    states = [
-        (axes[0, 1], coords_p1, metrics_p1, f"2. Phase 1: NSGA-II Optimal Biconnected Mesh\nCoverage: {metrics_p1['coverage_ratio']*100:.1f}% | Cut Vertices: {metrics_p1['n_articulation']}"),
-        (axes[1, 0], coords_fail, metrics_fail, f"3. Mid-Mission Failure (UAV #{failed_idx + 1} Crashed)\nCoverage: {metrics_fail['coverage_ratio']*100:.1f}% | Cut Vertices: {metrics_fail['n_articulation']}"),
-        (axes[1, 1], coords_heal, metrics_heal, f"4. Phase 2: Self-Healed Biconnected Mesh\nCoverage: {metrics_heal['coverage_ratio']*100:.1f}% | Cut Vertices: {metrics_heal['n_articulation']}"),
-    ]
-
-    for ax, uavs, metrics, title in states:
-        covered = metrics["covered_mask"]
-        ax.scatter(env.users[covered, 0], env.users[covered, 1], c="#27ae60", s=8, alpha=0.65)
-        ax.scatter(env.users[~covered, 0], env.users[~covered, 1], c="#e74c3c", marker="x", s=14, alpha=0.80)
-
-        all_nodes = np.vstack([env.gbs_pos, uavs])
-        for u, v in metrics["edges"]:
-            ax.plot([all_nodes[u, 0], all_nodes[v, 0]], [all_nodes[u, 1], all_nodes[v, 1]], color="#1f618d", linewidth=1.1, alpha=0.65)
-
-        for i, ((x, y, z), r) in enumerate(zip(uavs, env.ground_coverage_radius(uavs[:, 2]))):
-            is_cut = (i + 1) in metrics["articulation_nodes"]
-            ax.add_patch(Circle((x, y), r, color="#e67e22" if is_cut else "#3498db", alpha=0.09, lw=1.1, ls="--" if is_cut else "-"))
-            ax.scatter(x, y, c="#d35400" if is_cut else "#1b4f72", s=65, zorder=5, edgecolors="white", linewidth=1.0)
-
-        ax.scatter(env.gbs_pos[0], env.gbs_pos[1], c="#5b2c6f", marker="s", s=130, zorder=6)
-        ax.set_xlim(0, env.area_size)
-        ax.set_ylim(0, env.area_size)
-        ax.set_xlabel("X Coordinate (meters)")
-        ax.set_ylabel("Y Coordinate (meters)")
-        ax.grid(True, linestyle=":", alpha=0.4)
-        ax.set_title(title, fontsize=10.8, fontweight="bold")
-
-    output_path = Path("outputs")
-    output_path.mkdir(exist_ok=True)
-    fig.savefig(output_path / "nsga2_self_healing_dashboard.png", dpi=180)
+if __name__ == "__main__":
+    main()

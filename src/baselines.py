@@ -1,105 +1,93 @@
 import numpy as np
 from scipy.spatial.distance import cdist
+from sklearn.cluster import KMeans
+
+from src.graph_engine import evaluate_mesh_topology
 
 
-def hopcroft_tarjan_biconnectivity(adj_matrix):
-    n_nodes = adj_matrix.shape[0]
-    tin = np.full(n_nodes, -1, dtype=int)
-    low = np.full(n_nodes, -1, dtype=int)
-    visited = np.zeros(n_nodes, dtype=bool)
-    art_points = set()
-    timer = 0
-    adj_list = [np.flatnonzero(adj_matrix[u]) for u in range(n_nodes)]
+def run_baseline_1_pure_kmeans(env):
+    model = KMeans(n_clusters=env.n_uavs, n_init=10, random_state=42).fit(env.users)
+    xy = np.clip(model.cluster_centers_, 70.0, env.area_size - 70.0)
+    coords = np.column_stack((xy, np.full(env.n_uavs, env.h_opt)))
+    return coords, evaluate_mesh_topology(coords, env)
 
-    def dfs(u, parent, comp_accumulator):
-        nonlocal timer
-        visited[u] = True
-        comp_accumulator.append(u)
-        tin[u] = low[u] = timer
-        timer += 1
-        children_count = 0
 
-        for v in adj_list[u]:
-            if v == parent:
-                continue
-            if visited[v]:
-                if tin[v] < low[u]:
-                    low[u] = tin[v]
+def _prim_mst(nodes):
+    in_tree, remaining, edges = [0], set(range(1, len(nodes))), []
+    while remaining:
+        u, v = min(((u, v) for u in in_tree for v in remaining),
+                   key=lambda pair: np.linalg.norm(nodes[pair[0]] - nodes[pair[1]]))
+        distance = float(np.linalg.norm(nodes[u] - nodes[v]))
+        in_tree.append(v)
+        remaining.remove(v)
+        edges.append((u, v, distance))
+    return edges
+
+
+def run_baseline_2_kmeans_mst(env):
+    n_k = min(10, env.n_uavs)
+    model = KMeans(n_clusters=n_k, n_init=10, random_state=42).fit(env.users)
+    centers = model.cluster_centers_
+    nodes = np.vstack((env.gbs_pos[:2], centers))
+    edges = _prim_mst(nodes)
+    relay_count = env.n_uavs - n_k
+    allocations = [max(0, int(np.ceil(d / (0.88 * env.r_comm_a2a))) - 1) for _, _, d in edges]
+    allocation = [0] * len(edges)
+    for idx in sorted(range(len(edges)), key=lambda i: -edges[i][2]):
+        amount = min(allocations[idx], relay_count - sum(allocation))
+        allocation[idx] = amount
+    idx = 0
+    while sum(allocation) < relay_count:
+        allocation[idx % len(edges)] += 1
+        idx += 1
+
+    placed = [center for center in centers]
+    for (u, v, _), n_relays in zip(edges, allocation):
+        for s in range(1, n_relays + 1):
+            alpha = s / (n_relays + 1.0)
+            placed.append((1.0 - alpha) * nodes[u] + alpha * nodes[v])
+    xy = np.clip(np.asarray(placed[:env.n_uavs]), 70.0, env.area_size - 70.0)
+    coords = np.column_stack((xy, np.full(env.n_uavs, env.h_opt)))
+    return coords, evaluate_mesh_topology(coords, env)
+
+
+def run_baseline_3_connected_greedy(env):
+    """Greedily add a UAV inside the communication range of the existing mesh."""
+    coverage_radius = float(env.ground_coverage_radius(env.h_opt))
+    hop = np.sqrt(max(100.0, (0.90 * env.r_comm_a2a) ** 2 - env.h_opt ** 2))
+    angles = np.linspace(0.0, 2.0 * np.pi, 36, endpoint=False)
+    radial_steps = np.linspace(0.45 * hop, 0.95 * hop, 5)
+    placed = []
+    uncovered = np.ones(len(env.users), dtype=bool)
+
+    for _ in range(env.n_uavs):
+        parents = [env.gbs_pos[:2]] + placed
+        candidates = np.vstack([
+            np.column_stack((p[0] + r * np.cos(angles), p[1] + r * np.sin(angles)))
+            for p in parents for r in radial_steps
+        ])
+        bounds = ((candidates >= 70.0) & (candidates <= env.area_size - 70.0)).all(axis=1)
+        candidates = candidates[bounds]
+        if placed and len(candidates):
+            candidates = candidates[np.all(cdist(candidates, np.asarray(placed)) >= env.d_safe * 1.05, axis=1)]
+
+        if len(candidates) == 0:
+            # Keep the fallback inside bounds and avoid placing coincident UAVs.
+            candidates = np.array([[env.gbs_pos[0] + min(env.d_safe * (len(placed) + 1), hop), env.gbs_pos[1]]])
+            candidates = np.clip(candidates, 70.0, env.area_size - 70.0)
+
+        remaining_users = env.users[uncovered]
+        if len(remaining_users):
+            gains = np.sum(cdist(candidates, remaining_users) <= coverage_radius, axis=1)
+            if gains.max() > 0:
+                chosen = candidates[int(np.argmax(gains))]
             else:
-                children_count += 1
-                dfs(v, u, comp_accumulator)
-                if low[v] < low[u]:
-                    low[u] = low[v]
-                if parent != -1 and low[v] >= tin[u]:
-                    art_points.add(u)
+                target = remaining_users[np.argmin(np.linalg.norm(remaining_users - remaining_users.mean(axis=0), axis=1))]
+                chosen = candidates[np.argmin(np.linalg.norm(candidates - target, axis=1))]
+        else:
+            chosen = candidates[0]
+        placed.append(chosen)
+        uncovered[np.linalg.norm(env.users - chosen, axis=1) <= coverage_radius] = False
 
-        if parent == -1 and children_count > 1:
-            art_points.add(u)
-
-    components = []
-    for start_node in range(n_nodes):
-        if not visited[start_node]:
-            comp = []
-            dfs(start_node, -1, comp)
-            components.append(comp)
-
-    gbs_component = components[0] if len(components) > 0 else []
-    return len(components), gbs_component, sorted(list(art_points)), tin, low
-
-
-def evaluate_mesh_topology(uav_coords, env):
-    n_uavs = len(uav_coords)
-    all_nodes = np.vstack([env.gbs_pos, uav_coords])
-    dist_matrix = cdist(all_nodes, all_nodes)
-    adj_matrix = (dist_matrix <= env.r_comm_a2a) & (dist_matrix > 0.0)
-
-    n_components, gbs_comp, art_points, tin, low = hopcroft_tarjan_biconnectivity(adj_matrix)
-    active_uav_indices = [node - 1 for node in gbs_comp if node > 0]
-
-    if n_components == 1 and len(all_nodes) >= 3:
-        degrees = np.sum(adj_matrix, axis=1).astype(float)
-        laplacian = np.diag(degrees) - adj_matrix.astype(float)
-        eigenvalues = np.linalg.eigvalsh(laplacian)
-        alg_conn = float(max(0.0, eigenvalues[1]))
-        n_articulation = len(art_points)
-    else:
-        alg_conn = 0.0
-        n_articulation = len(art_points) + (n_components - 1) * 3
-
-    all_radii = env.ground_coverage_radius(uav_coords[:, 2])
-    all_horiz_dists = cdist(env.users, uav_coords[:, :2])
-    raw_covered_mask = np.any(all_horiz_dists <= all_radii[np.newaxis, :], axis=1)
-    raw_coverage_ratio = float(np.mean(raw_covered_mask))
-
-    if len(active_uav_indices) > 0:
-        conn_uavs = uav_coords[active_uav_indices]
-        radii = env.ground_coverage_radius(conn_uavs[:, 2])
-        horiz_dists = cdist(env.users, conn_uavs[:, :2])
-        covered_mask = np.any(horiz_dists <= radii[np.newaxis, :], axis=1)
-        coverage_ratio = float(np.mean(covered_mask))
-    else:
-        covered_mask = np.zeros(len(env.users), dtype=bool)
-        coverage_ratio = 0.0
-
-    uav_dists = dist_matrix[1:, 1:].copy()
-    np.fill_diagonal(uav_dists, np.inf)
-    sep_violation = float(np.sum(np.maximum(0.0, env.d_safe - uav_dists)) / 2.0)
-
-    cv = 100.0 * (n_components - 1) + 25.0 * n_articulation + sep_violation
-    edges = [(i, j) for i in range(n_uavs + 1) for j in range(i + 1, n_uavs + 1) if adj_matrix[i, j]]
-
-    return {
-        "edges": edges,
-        "raw_coverage_ratio": raw_coverage_ratio,
-        "coverage_ratio": coverage_ratio,
-        "covered_mask": covered_mask,
-        "active_uav_indices": active_uav_indices,
-        "n_components": n_components,
-        "n_articulation": len(art_points),
-        "penalty_articulation": n_articulation,
-        "articulation_nodes": set(art_points),
-        "algebraic_connectivity": alg_conn,
-        "sep_violation": sep_violation,
-        "cv": cv,
-        "is_biconnected": (n_components == 1 and len(art_points) == 0),
-    }
+    coords = np.column_stack((np.asarray(placed), np.full(env.n_uavs, env.h_opt)))
+    return coords, evaluate_mesh_topology(coords, env)

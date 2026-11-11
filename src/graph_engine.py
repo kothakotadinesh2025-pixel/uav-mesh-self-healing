@@ -1,75 +1,91 @@
 import numpy as np
+from scipy.spatial.distance import cdist
 
-from src.config import SimConfig
+
+def hopcroft_tarjan_biconnectivity(adj_matrix):
+    """Return component count, GBS component, articulation vertices, tin and low."""
+    n = len(adj_matrix)
+    tin = np.full(n, -1, dtype=int)
+    low = np.full(n, -1, dtype=int)
+    visited = np.zeros(n, dtype=bool)
+    articulation = set()
+    adjacency = [np.flatnonzero(adj_matrix[i]) for i in range(n)]
+    timer = 0
+
+    def dfs(u, parent, component):
+        nonlocal timer
+        visited[u] = True
+        component.append(u)
+        tin[u] = low[u] = timer
+        timer += 1
+        children = 0
+        for v in adjacency[u]:
+            if v == parent:
+                continue
+            if visited[v]:
+                low[u] = min(low[u], tin[v])
+            else:
+                children += 1
+                dfs(v, u, component)
+                low[u] = min(low[u], low[v])
+                if parent != -1 and low[v] >= tin[u]:
+                    articulation.add(u)
+        if parent == -1 and children > 1:
+            articulation.add(u)
+
+    components = []
+    for node in range(n):
+        if not visited[node]:
+            component = []
+            dfs(node, -1, component)
+            components.append(component)
+    gbs_component = next((c for c in components if 0 in c), [])
+    return len(components), gbs_component, sorted(articulation), tin, low
 
 
-class DisasterEnvironment:
-    def __init__(self, config: SimConfig | None = None, seed: int | None = None):
-        self.config = config or SimConfig()
-        self.rng = np.random.default_rng(seed if seed is not None else self.config.rng_seed)
+def evaluate_mesh_topology(uav_coords, env):
+    uav_coords = np.asarray(uav_coords, dtype=float)
+    all_nodes = np.vstack((env.gbs_pos, uav_coords))
+    distances = cdist(all_nodes, all_nodes)
+    adjacency = (distances <= env.r_comm_a2a) & (distances > 0.0)
+    n_components, gbs_component, articulation, tin, low = hopcroft_tarjan_biconnectivity(adjacency)
+    active = [node - 1 for node in gbs_component if node > 0]
 
-        self.area_size = self.config.area_size
-        self.h_min = self.config.h_min
-        self.h_max = self.config.h_max
-        self.n_uavs = self.config.n_uavs
-        self.n_users = self.config.n_users
-        self.r_comm_a2a = self.config.r_comm_a2a
-        self.d_safe = self.config.d_safe
-        self.n_clusters = int(self.rng.integers(self.config.cluster_min, self.config.cluster_max + 1))
+    if n_components == 1 and len(all_nodes) >= 3:
+        laplacian = np.diag(adjacency.sum(axis=1)) - adjacency.astype(float)
+        algebraic_connectivity = float(max(0.0, np.linalg.eigvalsh(laplacian)[1]))
+    else:
+        algebraic_connectivity = 0.0
 
-        self.a_los = 9.61
-        self.b_los = 0.16
-        self.eta_los = 1.0
-        self.eta_nlos = 20.0
-        self.fc_hz = 2.0e9
-        self.c_light = 3.0e8
-        self.l_th_db = 107.5
+    radii = env.ground_coverage_radius(uav_coords[:, 2])
+    local_distances = cdist(env.users, uav_coords[:, :2])
+    raw_mask = np.any(local_distances <= radii[None, :], axis=1)
+    if active:
+        connected_distances = local_distances[:, active]
+        connected_radii = radii[active]
+        covered_mask = np.any(connected_distances <= connected_radii[None, :], axis=1)
+    else:
+        covered_mask = np.zeros(len(env.users), dtype=bool)
 
-        gbs_xy = self.rng.uniform(180.0, 420.0, size=2)
-        self.gbs_pos = np.array([gbs_xy[0], gbs_xy[1], 0.0], dtype=float)
+    uav_distances = distances[1:, 1:].copy()
+    np.fill_diagonal(uav_distances, np.inf)
+    separation_violation = float(np.maximum(0.0, env.d_safe - uav_distances).sum() / 2.0)
+    effective_cuts = len(articulation) + max(0, n_components - 1) * 3
+    cv = 100.0 * max(0, n_components - 1) + 25.0 * effective_cuts + separation_violation
+    edges = [(i, j) for i in range(len(all_nodes)) for j in range(i + 1, len(all_nodes)) if adjacency[i, j]]
 
-        self._precompute_al_hourani_radius_curve()
-        self.users = self._generate_random_survivors()
-
-    def _precompute_al_hourani_radius_curve(self):
-        self.h_grid = np.linspace(self.h_min, self.h_max, 321)
-        r_test = np.linspace(1.0, 600.0, 1000)[np.newaxis, :]
-        h_col = self.h_grid[:, np.newaxis]
-
-        d_3d = np.sqrt(h_col**2 + r_test**2)
-        theta_deg = np.degrees(np.arctan2(h_col, r_test))
-
-        p_los = 1.0 / (1.0 + self.a_los * np.exp(-self.b_los * (theta_deg - self.a_los)))
-        fspl = 20.0 * np.log10(4.0 * np.pi * self.fc_hz * d_3d / self.c_light)
-        l_a2g = fspl + p_los * self.eta_los + (1.0 - p_los) * self.eta_nlos
-
-        valid_mask = l_a2g <= self.l_th_db
-        self.r_cov_lookup = np.where(
-            np.any(valid_mask, axis=1),
-            r_test[0, np.argmax(np.where(valid_mask, r_test, 0.0), axis=1)],
-            90.0,
-        )
-        self.h_opt = float(self.h_grid[np.argmax(self.r_cov_lookup)])
-
-    def ground_coverage_radius(self, altitudes):
-        return np.interp(altitudes, self.h_grid, self.r_cov_lookup)
-
-    def _generate_random_survivors(self):
-        n_scattered = int(0.25 * self.n_users)
-        n_clustered = self.n_users - n_scattered
-        centers = self.rng.uniform(300.0, self.area_size - 300.0, size=(self.n_clusters, 2))
-        weights = self.rng.dirichlet(np.ones(self.n_clusters))
-        counts = self.rng.multinomial(n_clustered, weights)
-
-        users_list = []
-        for (cx, cy), count in zip(centers, counts):
-            spread_x = self.rng.uniform(95.0, 185.0)
-            spread_y = self.rng.uniform(95.0, 185.0)
-            pts = self.rng.normal(loc=[cx, cy], scale=[spread_x, spread_y], size=(count, 2))
-            users_list.append(pts)
-
-        outliers = self.rng.uniform(100.0, self.area_size - 100.0, size=(n_scattered, 2))
-        users_list.append(outliers)
-
-        all_users = np.vstack(users_list)
-        return np.clip(all_users, 60.0, self.area_size - 60.0)
+    return {
+        "edges": edges,
+        "raw_coverage_ratio": float(raw_mask.mean()) if len(raw_mask) else 0.0,
+        "coverage_ratio": float(covered_mask.mean()) if len(covered_mask) else 0.0,
+        "covered_mask": covered_mask,
+        "active_uav_indices": active,
+        "n_components": n_components,
+        "n_articulation": len(articulation),
+        "penalty_articulation": effective_cuts,
+        "articulation_nodes": set(articulation),
+        "algebraic_connectivity": algebraic_connectivity,
+        "sep_violation": separation_violation,
+        "cv": cv,
+        "is_biconnected": n_components == 1 and not articulation,
+    }

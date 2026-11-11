@@ -1,20 +1,31 @@
 # 3D UAV Mesh Benchmark & Self-Healing System
 
-A complete Python project for modeling disaster-response UAV mesh deployment with:
+A modular Python simulation for disaster-response UAV mesh placement. The pipeline models survivor hotspots and Al-Hourani air-to-ground coverage, evaluates three placement baselines, optimizes a fleet with constrained NSGA-II, simulates a UAV failure, and runs a self-healing controller.
 
-- 3D Al-Hourani coverage modeling
-- 22-UAV disaster zone simulation
-- 1,800 survivor locations
-- three benchmark baselines
-- constrained NSGA-II optimizer
-- autonomous self-healing controller
-- visualization dashboards
+## Project layout
+
+```text
+src/
+  config.py             Simulation settings
+  physics.py            Environment and channel/coverage model
+  graph_engine.py       Mesh connectivity, articulation, and coverage metrics
+  baselines.py          K-Means, K-Means + MST, connected greedy
+  nsga2_optimizer.py    Constrained NSGA-II placement optimizer
+  self_healing.py       Virtual-force recovery controller
+  visualizer.py         Benchmark and recovery dashboards
+main.py                 End-to-end pipeline
+outputs/                Generated PNG dashboards and CSV metrics
+```
 
 ## Setup
 
+Python 3.10+ is recommended.
+
 ```bash
 python -m venv .venv
+# Linux/macOS
 source .venv/bin/activate
+# Windows PowerShell: .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
@@ -24,23 +35,6 @@ pip install -r requirements.txt
 python main.py
 ```
 
-## Project structure
+The default run uses 22 UAVs, 1,800 survivor locations, a population of 100, and 1,000 generations. It can take a while. For a quick smoke test, edit `SimConfig` in `src/config.py` to use a smaller `n_gen` and `pop_size`. The run writes `outputs/benchmark_metrics.csv` and two PNG dashboards, then displays the figures.
 
-```text
-src/
-  __init__.py
-  config.py
-  physics.py
-  graph_engine.py
-  baselines.py
-  nsga2_optimizer.py
-  self_healing.py
-  visualizer.py
-main.py
-requirements.txt
-README.md
-```
-
-## Notes
-
-The pipeline runs the three baseline algorithms and then executes the proposed optimizer and self-healing controller. It prints a comparative metrics table and displays the dashboards.
+A random disaster layout is generated per run. Set `rng_seed` in `SimConfig` for repeatable results. These are simulation results, not operational flight guidance.
