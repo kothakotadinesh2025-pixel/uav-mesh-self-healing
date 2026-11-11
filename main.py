@@ -47,6 +47,21 @@ def _save_metrics(path, rows):
             )
 
 
+def _select_worst_case_crash(coords, env):
+    """Choose the most damaging single-UAV loss, preferring connected outcomes."""
+    candidates = []
+    for idx in range(len(coords)):
+        test_coords = np.delete(coords, idx, axis=0)
+        metrics = evaluate_mesh_topology(test_coords, env)
+        impact_score = metrics["coverage_ratio"] * 100.0 - 4.0 * metrics["n_articulation"]
+        candidates.append((idx, metrics, impact_score))
+
+    connected = [candidate for candidate in candidates if candidate[1]["n_components"] == 1]
+    pool = connected if connected else candidates
+    failed_idx, _, _ = min(pool, key=lambda candidate: candidate[2])
+    return failed_idx
+
+
 def main(config=None, show=False):
     start = time.time()
     config = config or SimConfig()
@@ -70,11 +85,10 @@ def main(config=None, show=False):
     coords_p1 = population[best_idx].reshape(env.n_uavs, 3)
     m_p1 = evaluate_mesh_topology(coords_p1, env)
 
-    center = coords_p1[:, :2].mean(axis=0)
-    failed_idx = int(np.argmin(np.linalg.norm(coords_p1[:, :2] - center, axis=1)))
+    failed_idx = _select_worst_case_crash(coords_p1, env)
     coords_fail = np.delete(coords_p1, failed_idx, axis=0)
     m_fail = evaluate_mesh_topology(coords_fail, env)
-    print(f"\n[*] Simulated crash: UAV #{failed_idx + 1}; running self-healing controller...")
+    print(f"\n[*] Worst-case simulated crash: UAV #{failed_idx + 1}; running self-healing controller...")
     coords_heal, m_heal = SelfHealingController(env, seed=config.rng_seed).heal_mesh(coords_fail, episodes=95)
 
     rows = [
