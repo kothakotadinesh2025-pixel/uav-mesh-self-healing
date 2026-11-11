@@ -8,8 +8,9 @@ class SimConfig:
     h_max: float = 220.0
     n_uavs: int = 22
     n_users: int = 1800
-    r_comm_a2a: float = 720.0
+    r_comm_a2a: float = 560.0
     d_safe: float = 65.0
+    l_th_db: float = 103.8
     pop_size: int = 100
     n_gen: int = 1000
     cluster_min: int = 12
